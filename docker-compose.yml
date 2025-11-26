@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  sot-bot:
+    build: .
+    container_name: sot-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./db:/app/db
+    # Если нужно монтировать Excel-файл с хоста внутрь контейнера — раскомментируйте строку ниже
+    # и положите файл рядом с docker-compose.yml
+    #  - ./График выездов отдела СОТ.xlsx:/app/График выездов отдела СОТ.xlsx
