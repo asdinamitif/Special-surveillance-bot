@@ -245,12 +245,34 @@ def init_db() -> None:
         """
     )
 
+    # Добавим версионность согласований, если столбца ещё нет
+    c.execute("PRAGMA table_info(approvals)")
+    cols = [r["name"] for r in c.fetchall()]
+    if "schedule_version" not in cols:
+        try:
+            c.execute("ALTER TABLE approvals ADD COLUMN schedule_version INTEGER")
+        except Exception as e:
+            log.warning("Не удалось добавить столбец schedule_version: %s", e)
+
     # Настройки согласования графика (key-value)
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS schedule_settings (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+        """
+    )
+
+    # История версий загруженного графика (для возможного расширения)
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schedule_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version INTEGER,
+            uploaded_by INTEGER,
+            uploaded_at TEXT,
+            path TEXT
         )
         """
     )
@@ -301,6 +323,14 @@ def init_db() -> None:
             [(lbl,) for lbl in DEFAULT_APPROVERS],
         )
 
+    # Инициализируем версию графика, если не задана
+    c.execute("SELECT value FROM schedule_settings WHERE key='schedule_version'")
+    row_ver = c.fetchone()
+    if not row_ver:
+        c.execute(
+            "INSERT OR REPLACE INTO schedule_settings (key, value) VALUES ('schedule_version', '1')"
+        )
+
     conn.commit()
     conn.close()
 
@@ -328,6 +358,13 @@ def get_current_approvers(settings: dict) -> List[str]:
     if val2:
         return [val2]
     return []
+
+
+def get_schedule_version(settings: dict) -> int:
+    try:
+        return int(settings.get("schedule_version") or "1")
+    except Exception:
+        return 1
 
 
 def is_admin(user_id: int) -> bool:
@@ -387,26 +424,94 @@ def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
+def build_schedule_text(is_admin_flag: bool, settings: dict) -> str:
+    approvers = get_current_approvers(settings)
+    version = get_schedule_version(settings)
+
+    lines: List[str] = []
+    lines.append("Раздел «График».")
+    lines.append("")
+    lines.append(f"Текущая версия файла графика: {version}")
+    lines.append("")
+    lines.append(
+        "Порядок работы:\n"
+        "1) Администратор выбирает, КТО согласует (из списка @... или добавляет своего).\n"
+        "2) У выбранных появится уведомление «У вас на рассмотрении новый график».\n"
+        "3) Каждый согласующий нажимает «✅ Согласовать» или «✏ На доработку».\n"
+        "4) Внизу видно, кто уже согласовал и когда, а кто ещё в ожидании."
+    )
+    lines.append("")
+    lines.append("Статусы согласования:")
+
+    if not approvers:
+        lines.append("• Согласующие ещё не выбраны.")
+        return "\n".join(lines)
+
+    conn = get_db()
+    c = conn.cursor()
+    placeholders = ",".join("?" * len(approvers))
+    params: List[Any] = [version] + approvers
+    c.execute(
+        f"""
+        SELECT approver, decision, decided_at
+        FROM approvals
+        WHERE schedule_version = ?
+          AND approver IN ({placeholders})
+        ORDER BY datetime(decided_at) DESC
+        """,
+        params,
+    )
+    rows = c.fetchall()
+    conn.close()
+
+    last_by_approver: Dict[str, sqlite3.Row] = {}
+    for r in rows:
+        appr = r["approver"]
+        if appr not in last_by_approver:
+            last_by_approver[appr] = r
+
+    total = len(approvers)
+    approved_count = 0
+    rework_count = 0
+
+    for appr in approvers:
+        r = last_by_approver.get(appr)
+        if not r:
+            lines.append(f"• {appr} — ожидает согласования")
+            continue
+        decision = r["decision"]
+        dt_raw = r["decided_at"] or ""
+        try:
+            dt_obj = datetime.fromisoformat(dt_raw)
+            dt_str = dt_obj.strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            dt_str = dt_raw
+
+        if decision == "approve":
+            approved_count += 1
+            lines.append(f"• {appr} — ✅ согласовано ({dt_str})")
+        elif decision == "rework":
+            rework_count += 1
+            lines.append(f"• {appr} — ✏ на доработку ({dt_str})")
+        else:
+            lines.append(f"• {appr} — {decision or 'ожидает'} ({dt_str})")
+
+    lines.append("")
+    if rework_count > 0:
+        lines.append("Итог: график по текущей версии направлен на доработку.")
+    elif approved_count == total and total > 0:
+        lines.append("Итог: все выбранные согласующие утвердили график.")
+    else:
+        lines.append(
+            f"Итог: согласовали {approved_count} из {total}, остальные в ожидании."
+        )
+
+    return "\n".join(lines)
+
+
 def build_schedule_inline(
     is_admin_flag: bool, settings: dict
 ) -> InlineKeyboardMarkup:
-    approvers = get_current_approvers(settings)
-    status = settings.get("schedule_status")  # pending / approved / rework / None
-    decided_by = settings.get("schedule_decided_by")
-
-    if approvers and status == "pending":
-        status_line = "На согласовании у " + ", ".join(approvers)
-    elif status == "approved":
-        who = decided_by or (", ".join(approvers) if approvers else "")
-        status_line = f"Согласовано: {who}"
-    elif status == "rework":
-        who = decided_by or (", ".join(approvers) if approvers else "")
-        status_line = f"Направлено на доработку ({who})"
-    elif approvers:
-        status_line = "Согласующие: " + ", ".join(approvers)
-    else:
-        status_line = "Согласующие ещё не выбраны"
-
     # Кнопки согласующих из таблицы approvers
     conn = get_db()
     c = conn.cursor()
@@ -449,9 +554,12 @@ def build_schedule_inline(
             [InlineKeyboardButton("⬇ Скачать", callback_data="schedule_download")]
         )
 
-    header.append([InlineKeyboardButton(status_line, callback_data="noop")])
+    header.append(
+        [InlineKeyboardButton("Статусы согласования", callback_data="noop")]
+    )
 
     footer: List[List[InlineKeyboardButton]] = []
+    status = settings.get("schedule_status")
     if status in (None, "", "pending"):
         footer.append(
             [
@@ -473,6 +581,11 @@ def remarks_menu_inline() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("✅ Устранены", callback_data="remarks_done"),
                 InlineKeyboardButton("❌ Не устранены", callback_data="remarks_not_done"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "➖ Не требуется", callback_data="remarks_not_required"
+                ),
             ],
             [
                 InlineKeyboardButton(
@@ -588,13 +701,7 @@ async def handle_menu_schedule(
         return
     admin_flag = is_admin(user.id)
     settings = get_schedule_state()
-    text = (
-        "Раздел «График».\n"
-        "1) Администратор выбирает, КТО согласует (из списка @... или добавляет своего).\n"
-        "2) У выбранных появится уведомление «На рассмотрении у вас».\n"
-        "3) Пока никто не ответил — все видят статус «На согласовании».\n"
-        "4) После ответа — статус «Согласовано» или «На доработку»."
-    )
+    text = build_schedule_text(admin_flag, settings)
     await update.message.reply_text(
         text,
         reply_markup=build_schedule_inline(admin_flag, settings),
@@ -648,7 +755,7 @@ async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # Выбор согласующего из списка — теперь это toggle (добавить/убрать)
+    # Выбор согласующего из списка — toggle (добавить/убрать)
     if data.startswith("schedule_set_approver:"):
         if not is_admin(user.id):
             await query.answer(
@@ -671,7 +778,7 @@ async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "INSERT OR REPLACE INTO schedule_settings (key, value) VALUES ('current_approvers', ?)",
             (",".join(current),),
         )
-        # при любом изменении состава — статус снова "pending"
+        # при изменении состава — статус снова "pending"
         c.execute(
             "INSERT OR REPLACE INTO schedule_settings (key, value) VALUES ('schedule_status', 'pending')"
         )
@@ -709,8 +816,9 @@ async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         conn.close()
 
         settings = get_schedule_state()
+        text = build_schedule_text(is_admin(user.id), settings)
         await query.edit_message_text(
-            "Состав согласующих обновлён.",
+            text,
             reply_markup=build_schedule_inline(is_admin(user.id), settings),
         )
         return
@@ -738,13 +846,14 @@ async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         approver_label = user_at or (approvers[0] if approvers else "")
+        version = get_schedule_version(settings)
 
         conn = get_db()
         c = conn.cursor()
         c.execute(
             """
-            INSERT INTO approvals (user_id, username, approver, decision, comment, decided_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO approvals (user_id, username, approver, decision, comment, decided_at, schedule_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user.id,
@@ -753,44 +862,81 @@ async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "approve",
                 "",
                 local_now().isoformat(),
+                version,
             ),
         )
+
+        # Пересчёт общего статуса по всем согласующим на этой версии
         c.execute(
-            "INSERT OR REPLACE INTO schedule_settings (key, value) VALUES ('schedule_status', 'approved')"
+            "SELECT approver, decision FROM approvals WHERE schedule_version = ?",
+            (version,),
+        )
+        all_rows = c.fetchall()
+        last_by_approver: Dict[str, sqlite3.Row] = {}
+        for r in all_rows:
+            a = r["approver"]
+            if a not in last_by_approver:
+                last_by_approver[a] = r
+
+        total = len(approvers)
+        approved_count = 0
+        rework_count = 0
+        for a in approvers:
+            r = last_by_approver.get(a)
+            if not r:
+                continue
+            if r["decision"] == "approve":
+                approved_count += 1
+            elif r["decision"] == "rework":
+                rework_count += 1
+
+        if rework_count > 0:
+            status = "rework"
+            decided_by = approver_label
+        elif approved_count == total and total > 0:
+            status = "approved"
+            decided_by = "Все согласовали"
+        else:
+            status = "pending"
+            decided_by = ""
+
+        c.execute(
+            "INSERT OR REPLACE INTO schedule_settings (key, value) VALUES ('schedule_status', ?)",
+            (status,),
         )
         c.execute(
             "INSERT OR REPLACE INTO schedule_settings (key, value) VALUES ('schedule_decided_by', ?)",
-            (approver_label,),
+            (decided_by,),
         )
         c.execute(
             "INSERT OR REPLACE INTO schedule_settings (key, value) VALUES ('schedule_decided_at', ?)",
             (local_now().isoformat(),),
         )
 
-        c.execute("SELECT user_id FROM admins")
-        admins = [r["user_id"] for r in c.fetchall()]
-        c.execute("SELECT user_id FROM users")
-        others = [r["user_id"] for r in c.fetchall()]
+        # уведомление всем админам и пользователям, если все согласовали
+        if status == "approved":
+            c.execute("SELECT user_id FROM admins")
+            admins = [r["user_id"] for r in c.fetchall()]
+            c.execute("SELECT user_id FROM users")
+            others = [r["user_id"] for r in c.fetchall()]
+            text_notify = (
+                f"График выездов СОТ (версия {version}) полностью согласован всеми согласующими."
+            )
+            for uid in set(admins + others):
+                try:
+                    await query.bot.send_message(chat_id=uid, text=text_notify)
+                except Exception:
+                    pass
+
         conn.commit()
         conn.close()
 
-        text_notify = f"График выездов СОТ согласован: {approver_label}."
-        for uid in set(admins + others):
-            try:
-                await query.bot.send_message(chat_id=uid, text=text_notify)
-            except Exception:
-                pass
-
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        f"✅ Согласовано: {approver_label}", callback_data="noop"
-                    )
-                ]
-            ]
+        settings = get_schedule_state()
+        text = build_schedule_text(is_admin(user.id), settings)
+        await query.edit_message_text(
+            text,
+            reply_markup=build_schedule_inline(is_admin(user.id), settings),
         )
-        await query.edit_message_text("График согласован.", reply_markup=kb)
         return
 
     # На доработку
@@ -921,13 +1067,14 @@ async def handle_rework_comment(
         if user.username
         else (approvers[0] if approvers else "")
     )
+    version = get_schedule_version(settings)
 
     conn = get_db()
     c = conn.cursor()
     c.execute(
         """
-        INSERT INTO approvals (user_id, username, approver, decision, comment, decided_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO approvals (user_id, username, approver, decision, comment, decided_at, schedule_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user.id,
@@ -936,6 +1083,7 @@ async def handle_rework_comment(
             "rework",
             reason,
             local_now().isoformat(),
+            version,
         ),
     )
     c.execute(
@@ -959,7 +1107,7 @@ async def handle_rework_comment(
             await update.get_bot().send_message(
                 chat_id=uid,
                 text=(
-                    f"График выездов СОТ отправлен на доработку ({approver_label}).\n"
+                    f"График выездов СОТ (версия {version}) отправлен на доработку ({approver_label}).\n"
                     f"Причина: {reason}"
                 ),
             )
@@ -1057,7 +1205,44 @@ async def document_handler(
         context.user_data["await_schedule_file"] = False
         SCHEDULE_CACHE["mtime"] = None
         SCHEDULE_CACHE["df"] = None
-        await msg.reply_text("Файл графика сохранён.", reply_markup=main_menu())
+
+        # Новая версия графика: увеличиваем версию и фиксируем в истории
+        settings = get_schedule_state()
+        current_ver = get_schedule_version(settings)
+        new_ver = current_ver + 1
+        conn = get_db()
+        c = conn.cursor()
+        c.execute(
+            "INSERT OR REPLACE INTO schedule_settings (key, value) VALUES ('schedule_version', ?)",
+            (str(new_ver),),
+        )
+        c.execute(
+            "INSERT OR REPLACE INTO schedule_settings (key, value) VALUES ('schedule_status', 'pending')"
+        )
+        c.execute(
+            "INSERT OR REPLACE INTO schedule_settings (key, value) VALUES ('schedule_decided_by', '')"
+        )
+        c.execute(
+            "INSERT OR REPLACE INTO schedule_settings (key, value) VALUES ('schedule_decided_at', '')"
+        )
+        c.execute(
+            """
+            INSERT INTO schedule_files (version, uploaded_by, uploaded_at, path)
+            VALUES (?, ?, ?, ?)
+            """,
+            (new_ver, user.id, local_now().isoformat(), SCHEDULE_PATH),
+        )
+        conn.commit()
+        conn.close()
+
+        settings = get_schedule_state()
+        admin_flag = is_admin(user.id)
+        text = build_schedule_text(admin_flag, settings)
+
+        await msg.reply_text(
+            "Файл графика сохранён и запущен новый цикл согласования.\n\n" + text,
+            reply_markup=build_schedule_inline(admin_flag, settings),
+        )
         return
 
     # рабочий файл (REMARKS)
@@ -1084,8 +1269,8 @@ async def handle_menu_remarks(
     await update.message.reply_text(
         "Раздел «Замечания».\n"
         "1) Через «⬆ Загрузить» админ загружает рабочий файл с замечаниями.\n"
-        "2) Через «🏗 ОНзС» можно открыть объекты и менять статусы.\n"
-        "3) Здесь можно вывести списки «Устранены» / «Не устранены».",
+        "2) Статусы «Устранены» / «Не устранены» / «Не требуется» берутся из столбцов Q, R, Y, AD.\n"
+        "3) Через кнопки ниже выводятся списки по этим статусам.",
         reply_markup=remarks_menu_inline(),
     )
 
@@ -1132,43 +1317,58 @@ async def remarks_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     col_pb_count = get_col_by_letter(df, "O")   # Кол-во нарушений ПБ
     col_eom_count = get_col_by_letter(df, "AC")  # Кол-во нарушений ЭОМ
 
-    conn = get_db()
-    c = conn.cursor()
+    # Маркеры устранения из файла (Q, R, Y, AD)
+    col_pb_mark = get_col_by_letter(df, "Q")     # ПБ
+    col_pbzk_mark = get_col_by_letter(df, "R")   # ПБ в ЗК КНД
+    col_ar_mark = get_col_by_letter(df, "Y")     # АР/ММГН/АГО
+    col_eom_mark = get_col_by_letter(df, "AD")   # ЭОМ
 
-    lines = []
     if data == "remarks_done":
-        caption = "Список объектов, где замечания устранены (есть хотя бы одно «да» и нет «нет»):"
-    else:
-        caption = "Список объектов, где есть неустранённые замечания (есть хотя бы одно «нет»):"
-    lines.append(caption)
-    lines.append("")
+        caption = "Список объектов, где замечания УСТРАНЕНЫ (есть «да» и нет «нет» в Q/R/Y/AD):"
+    elif data == "remarks_not_done":
+        caption = "Список объектов, где замечания НЕ УСТРАНЕНЫ (есть хотя бы одно «нет» в Q/R/Y/AD):"
+    else:  # remarks_not_required
+        caption = "Список объектов, где отметки об устранении НЕ ТРЕБУЮТСЯ (Q/R/Y/AD пустые):"
+
+    lines: List[str] = [caption, ""]
 
     for idx, row in df.iterrows():
         excel_row = int(idx) + 1
-        c.execute(
-            """
-            SELECT pb_status, pbzk_status, ar_status
-            FROM remarks_status
-            WHERE excel_row = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (excel_row,),
-        )
-        st = c.fetchone()
-        if not st:
-            continue
-        vals = [st["pb_status"], st["pbzk_status"], st["ar_status"]]
-        vals_clean = [v for v in vals if v]
-        has_yes = any(v == "да" for v in vals_clean)
-        has_no = any(v == "нет" for v in vals_clean)
 
-        if data == "remarks_done":
-            if not has_yes or has_no:
+        marks_raw: List[str] = []
+        for col in (col_pb_mark, col_pbzk_mark, col_ar_mark, col_eom_mark):
+            if not col:
+                marks_raw.append("")
                 continue
+            v = str(row.get(col, "")).strip().lower()
+            if v in ("да", "нет"):
+                marks_raw.append(v)
+            elif not v or v == "nan":
+                marks_raw.append("")
+            else:
+                marks_raw.append(v)
+
+        has_yes = any(v == "да" for v in marks_raw)
+        has_no = any(v == "нет" for v in marks_raw)
+        all_empty = all(not v for v in marks_raw)
+
+        # Определяем категорию строки
+        if has_no:
+            row_category = "not_done"
+        elif has_yes:
+            row_category = "done"
+        elif all_empty:
+            row_category = "not_required"
         else:
-            if not has_no:
-                continue
+            # смешанные/другие значения — пропускаем, чтобы не гадать
+            continue
+
+        if data == "remarks_done" and row_category != "done":
+            continue
+        if data == "remarks_not_done" and row_category != "not_done":
+            continue
+        if data == "remarks_not_required" and row_category != "not_required":
+            continue
 
         obj = row.get(col_obj, "") if col_obj else ""
         addr = row.get(col_addr, "") if col_addr else ""
@@ -1184,34 +1384,52 @@ async def remarks_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             except Exception:
                 date_str = str(dv)
 
-        line = f"• Строка {excel_row}"
+        # Текст статуса по строке
+        if row_category == "done":
+            cat_text = "Устранены"
+        elif row_category == "not_done":
+            cat_text = "Не устранены"
+        else:
+            cat_text = "Не требуется"
+
+        line = f"• Строка {excel_row} — статус по документу: {cat_text}"
         if date_str:
-            line += f", дата выезда {date_str}"
+            line += f"\n  Дата выезда: {date_str}"
         if onzs:
-            line += f", ОНзС {onzs}"
+            line += f"\n  ОНзС: {onzs}"
         if obj:
             line += f"\n  Объект: {obj}"
         if addr:
             line += f"\n  Адрес: {addr}"
+
+        # Детализация по маркерам Q/R/Y/AD + числа нарушений
+        pb_mark_val = row.get(col_pb_mark, "") if col_pb_mark else ""
+        pbzk_mark_val = row.get(col_pbzk_mark, "") if col_pbzk_mark else ""
+        ar_mark_val = row.get(col_ar_mark, "") if col_ar_mark else ""
+        eom_mark_val = row.get(col_eom_mark, "") if col_eom_mark else ""
+
         line += (
-            f"\n  Статусы: ПБ={st['pb_status'] or '-'}; "
-            f"ПБ ЗК КНД={st['pbzk_status'] or '-'}; "
-            f"АР/ММГН/АГО={st['ar_status'] or '-'}"
+            f"\n  Статусы (из Q/R/Y/AD): "
+            f"ПБ={pb_mark_val or '-'}; "
+            f"ПБ в ЗК КНД={pbzk_mark_val or '-'}; "
+            f"АР/ММГН/АГО={ar_mark_val or '-'}; "
+            f"ЭОМ={eom_mark_val or '-'}"
         )
-        # Добавим в вывод количества нарушений, если колонки есть
+
         if col_pb_count:
             line += f"\n  Кол-во нарушений ПБ: {row.get(col_pb_count, '') or '-'}"
         if col_eom_count:
             line += f"\n  Кол-во нарушений ЭОМ: {row.get(col_eom_count, '') or '-'}"
+
         lines.append(line)
         lines.append("")
 
         if len("\n".join(lines)) > 3500:
             break
 
-    conn.close()
     if len(lines) == 2:
         lines.append("По текущему файлу таких строк нет.")
+
     await query.edit_message_text("\n".join(lines))
 
 
@@ -1452,16 +1670,16 @@ async def send_onzs_list(
         text_lines.append("Пожарная безопасность:")
         pb_cnt = row.get(col_pb_count, "") if col_pb_count else ""
         pb_rr = row.get(col_pb_rr, "") if col_pb_rr else ""
-        pb_mark = row.get(col_pb_mark, "") if col_pb_mark else ""
-        pbzk_mark = row.get(col_pbzk_mark, "") if col_pbzk_mark else ""
+        pb_mark_val = row.get(col_pb_mark, "") if col_pb_mark else ""
+        pbzk_mark_val = row.get(col_pbzk_mark, "") if col_pbzk_mark else ""
         pb_file = row.get(col_pb_file, "") if col_pb_file else ""
         pb_act = row.get(col_pb_act, "") if col_pb_act else ""
         pb_note = row.get(col_pb_note, "") if col_pb_note else ""
 
         text_lines.append(f"• Кол-во нарушений ПБ: {pb_cnt or '-'}")
         text_lines.append(f"• РР (нужен/не нужен): {pb_rr or '-'}")
-        text_lines.append(f"• Отметка об устранении замечаний ПБ: {pb_mark or '-'}")
-        text_lines.append(f"• Отметка об устранении замечаний ПБ в ЗК КНД: {pbzk_mark or '-'}")
+        text_lines.append(f"• Отметка об устранении замечаний ПБ: {pb_mark_val or '-'}")
+        text_lines.append(f"• Отметка об устранении замечаний ПБ в ЗК КНД: {pbzk_mark_val or '-'}")
         text_lines.append(f"• Ссылка на файл с замечаниями ПБ: {pb_file or '-'}")
         text_lines.append(f"• Ссылка на акт об устранении ПБ: {pb_act or '-'}")
         text_lines.append(f"• Примечание ПБ: {pb_note or '-'}")
@@ -1742,14 +1960,26 @@ async def handle_analytics_password(
         """
     )
     rows = c.fetchall()
+
+    # История согласований графика
+    c.execute(
+        """
+        SELECT schedule_version, approver, decision, comment, decided_at
+        FROM approvals
+        ORDER BY datetime(decided_at) DESC
+        LIMIT 10
+        """
+    )
+    hist = c.fetchall()
+
     conn.close()
 
     lines = ["📈 Аналитика:", ""]
-    lines.append("1️⃣ Согласование графика:")
+    lines.append("1️⃣ Согласование графика (общее количество решений):")
     lines.append(f"   • Согласовано: {appr.get('approve', 0)}")
     lines.append(f"   • На доработку: {appr.get('rework', 0)}")
     lines.append("")
-    lines.append("2️⃣ Замечания:")
+    lines.append("2️⃣ Замечания (по вручную изменённым статусам в боте):")
     lines.append(f"   • Есть устранённые (есть «да»): {done}")
     lines.append(f"   • Есть неустранённые (есть «нет»): {not_done}")
     lines.append("")
@@ -1761,6 +1991,32 @@ async def handle_analytics_password(
             )
     else:
         lines.append("   • пока нет данных")
+
+    lines.append("")
+    lines.append("4️⃣ История согласований графика (последние 10 решений):")
+    if hist:
+        for r in hist:
+            ver = r["schedule_version"] if r["schedule_version"] is not None else "-"
+            appr_label = r["approver"] or "—"
+            decision = r["decision"]
+            if decision == "approve":
+                dec_text = "Согласовано"
+            elif decision == "rework":
+                dec_text = "На доработку"
+            else:
+                dec_text = decision or "—"
+            dt_raw = r["decided_at"] or ""
+            try:
+                dt_obj = datetime.fromisoformat(dt_raw)
+                dt_str = dt_obj.strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                dt_str = dt_raw
+            comment = f" (комментарий: {r['comment']})" if r["comment"] else ""
+            lines.append(
+                f"   • Версия {ver}: {appr_label} — {dec_text} {dt_str}{comment}"
+            )
+    else:
+        lines.append("   • пока нет решений по графику")
 
     await update.message.reply_text("\n".join(lines))
 
